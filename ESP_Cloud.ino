@@ -11,11 +11,10 @@ static const IPAddress WIFI_SUBNET(255, 255, 255, 0);
 static const IPAddress WIFI_DNS1(192, 168, 23, 1);
 static const IPAddress WIFI_DNS2(8, 8, 8, 8);
 
-static const uint32_t WIFI_ATTEMPT_MS   = 10000;
-static const uint32_t WIFI_RETRY_GAP_MS = 5000;
-static const uint32_t WIFI_BLINK_MS     = 500;
-static const uint8_t  WIFI_MAX_ATTEMPTS = 8;
-static const uint32_t TCP_RETRY_MS      = 2000;
+static const uint32_t WIFI_BLINK_MS         = 500;
+static const uint8_t  WIFI_BLINK_COUNT      = 5;
+static const uint32_t WIFI_BOOT_DEADLINE_MS = 90000;
+static const uint32_t TCP_RETRY_MS          = 2000;
 
 WiFiClient client;
 
@@ -42,7 +41,6 @@ GxEPD2_BW<EpdDriver, EpdDriver::HEIGHT> display(EpdDriver(EPD_CS, EPD_DC, EPD_RS
 enum WifiBootState : uint8_t
 {
   WIFI_BOOT_TRYING,
-  WIFI_BOOT_RETRY_WAIT,
   WIFI_BOOT_DONE
 };
 
@@ -75,10 +73,12 @@ static bool g_wifiIconVisibleOnDisplay = false;
 static bool g_wifiIconBackupValid = false;
 static bool g_wifiBootGaveUp = false;
 static bool g_wifiBlinkVisible = false;
+static bool g_wifiBlinkDone = false;
 static bool g_epdInited = false;
 static bool g_hasFlashBackup = false;
-static uint8_t g_wifiAttempts = 0;
-static uint32_t g_wifiStateMs = 0;
+static bool g_transferIconVisible = false;
+static uint8_t g_wifiBlinkCount = 0;
+static uint32_t g_wifiBootStartMs = 0;
 static uint32_t g_wifiBlinkMs = 0;
 static uint32_t g_wifiReadyMs = 0;
 static uint32_t g_transferStartMs = 0;
@@ -89,10 +89,15 @@ static WifiBootState g_wifiBootState = WIFI_BOOT_TRYING;
 static constexpr uint16_t FB_ROW_BYTES = EPD_W / 8;
 static constexpr uint16_t WIFI_ICON_X = 0;
 static constexpr uint16_t WIFI_ICON_Y = 0;
-static constexpr uint16_t WIFI_ICON_W = 16;
-static constexpr uint16_t WIFI_ICON_H = 12;
-static constexpr uint16_t WIFI_ICON_BYTES = (WIFI_ICON_W / 8) * WIFI_ICON_H;
+static constexpr uint16_t WIFI_ICON_W = 18;
+static constexpr uint16_t WIFI_ICON_H = 18;
+static constexpr uint16_t WIFI_ICON_BYTES = ((WIFI_ICON_W + 7) / 8) * WIFI_ICON_H;
 static uint8_t wifiIconBackup[WIFI_ICON_BYTES];
+static constexpr uint16_t TRANSFER_ICON_X = 24;
+static constexpr uint16_t TRANSFER_ICON_Y = 0;
+static constexpr uint16_t TRANSFER_ICON_W = 18;
+static constexpr uint16_t TRANSFER_ICON_H = 18;
+static constexpr uint16_t TRANSFER_ICON_BYTES = ((TRANSFER_ICON_W + 7) / 8) * TRANSFER_ICON_H;
 static const char* FB_BACKUP_PATH = "/fb.bin";
 
 static uint8_t reverseByte(uint8_t b)
@@ -152,13 +157,12 @@ static void configureWiFi()
 
 static void startWiFiAttempt()
 {
-  WiFi.disconnect(false, false);
   WiFi.begin(WIFI_SSID, WIFI_PSK);
 }
 
 static void backupWifiIconArea()
 {
-  const uint16_t rowBytes = WIFI_ICON_W / 8;
+  const uint16_t rowBytes = (WIFI_ICON_W + 7) / 8;
   for (uint16_t row = 0; row < WIFI_ICON_H; ++row)
   {
     memcpy(
@@ -172,7 +176,7 @@ static void backupWifiIconArea()
 
 static void restoreWifiIconArea()
 {
-  const uint16_t rowBytes = WIFI_ICON_W / 8;
+  const uint16_t rowBytes = (WIFI_ICON_W + 7) / 8;
   for (uint16_t row = 0; row < WIFI_ICON_H; ++row)
   {
     memcpy(
@@ -189,10 +193,10 @@ static void setFbBlackPixel(uint16_t x, uint16_t y)
   fb[y * FB_ROW_BYTES + (x / 8)] &= (uint8_t)~(0x80 >> (x & 7));
 }
 
-static void setBitmapBlackPixel(uint8_t* bmp, uint16_t w, uint16_t x, uint16_t y)
+static void setBitmapBlackPixel(uint8_t* bmp, uint16_t w, uint16_t h, uint16_t x, uint16_t y)
 {
-  if (x >= w || y >= WIFI_ICON_H) return;
-  const uint16_t rowBytes = w / 8;
+  if (x >= w || y >= h) return;
+  const uint16_t rowBytes = (w + 7) / 8;
   bmp[y * rowBytes + (x / 8)] &= (uint8_t)~(0x80 >> (x & 7));
 }
 
@@ -200,19 +204,23 @@ static bool wifiIconPixel(uint16_t x, uint16_t y)
 {
   if (x >= WIFI_ICON_W || y >= WIFI_ICON_H) return false;
 
-  // Simple WiFi glyph made from three arcs and a dot.
-  if (x >= 7 && x <= 8 && y >= 9) return true;
+  // Dot at the bottom, 3x3.
+  if (x >= 7 && x <= 9 && y >= 14 && y <= 16) return true;
 
-  const float cx = 7.5f;
-  const float cy = 10.0f;
+  // Three concentric arcs, clipped to a sector so they read as a WiFi fan:
+  // biggest arc on top, smallest just above the dot.
+  const float cx = 8.5f;
+  const float cy = 16.5f;
   const float dx = float(x) - cx;
-  const float dy = float(y) - cy;
-  const float d = sqrtf(dx * dx + dy * dy);
+  const float dyUp = cy - float(y);
+  const float d = sqrtf(dx * dx + (float(y) - cy) * (float(y) - cy));
 
-  const float radii[] = { 8.0f, 5.0f, 2.5f };
-  for (float r : radii)
+  if (dyUp > 0.0f)
   {
-    if (fabsf(d - r) <= 0.45f && y <= 10) return true;
+    // Outer arc: wider sector.
+    if (fabsf(dx) <= 1.2f * dyUp && fabsf(d - 15.0f) <= 0.9f) return true;
+    // Inner arc: narrower sector so it ends a little shorter.
+    if (fabsf(dx) <= 0.9f * dyUp && fabsf(d - 8.25f) <= 0.9f) return true;
   }
   return false;
 }
@@ -238,9 +246,9 @@ static bool noNetworkIconPixel(uint16_t x, uint16_t y)
 {
   if (x >= WIFI_ICON_W || y >= WIFI_ICON_H) return false;
 
-  const int slashX = 2 + (int)y;
-  if ((int)x == slashX || (int)x == slashX - 1) return true;
-  if ((int)x == slashX - 2 || (int)x == slashX + 1) return false;
+  const int slashX = (int)y;
+  if ((int)x == slashX || (int)x == slashX + 1) return true;
+  if ((int)x == slashX - 1 || (int)x == slashX + 2) return false;
   return wifiIconPixel(x, y);
 }
 
@@ -258,7 +266,46 @@ static void buildWifiIconBitmap(uint8_t* bmp, WifiIconMode mode)
                         : noNetworkIconPixel(x, y);
       if (on)
       {
-        setBitmapBlackPixel(bmp, WIFI_ICON_W, x, y);
+        setBitmapBlackPixel(bmp, WIFI_ICON_W, WIFI_ICON_H, x, y);
+      }
+    }
+  }
+}
+
+static bool transferIconPixel(uint16_t x, uint16_t y)
+{
+  if (x >= TRANSFER_ICON_W || y >= TRANSFER_ICON_H) return false;
+
+  // Two vertical lines: left one carries an up arrow, right one a down arrow.
+  // Left column (up arrow + line).
+  if (y == 0 && x >= 4 && x <= 5) return true;
+  if (y == 1 && x >= 3 && x <= 6) return true;
+  if (y == 2 && x >= 2 && x <= 7) return true;
+  if (y == 3 && x >= 1 && x <= 8) return true;
+  if (y >= 4 && x >= 4 && x <= 5) return true;
+
+  // Right column (line + down arrow).
+  if (y <= 13 && x >= 12 && x <= 13) return true;
+  if (y == 14 && x >= 9 && x <= 16) return true;
+  if (y == 15 && x >= 10 && x <= 15) return true;
+  if (y == 16 && x >= 11 && x <= 14) return true;
+  if (y == 17 && x >= 12 && x <= 13) return true;
+
+  return false;
+}
+
+static void buildTransferIconBitmap(uint8_t* bmp, bool visible)
+{
+  memset(bmp, 0xFF, TRANSFER_ICON_BYTES);
+  if (!visible) return;
+
+  for (uint16_t y = 0; y < TRANSFER_ICON_H; ++y)
+  {
+    for (uint16_t x = 0; x < TRANSFER_ICON_W; ++x)
+    {
+      if (transferIconPixel(x, y))
+      {
+        setBitmapBlackPixel(bmp, TRANSFER_ICON_W, TRANSFER_ICON_H, x, y);
       }
     }
   }
@@ -334,12 +381,25 @@ static void ensureEpdReadyForIcons()
   }
 }
 
-static void drawWifiIconBitmap(const uint8_t* bmp)
+static void drawIconAt(const uint8_t* bmp, uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
   ensureEpdReadyForIcons();
   display.setRotation(ROTATION);
-  display.drawImage(bmp, WIFI_ICON_X, WIFI_ICON_Y, WIFI_ICON_W, WIFI_ICON_H, false, false, false);
+  display.drawImage(bmp, x, y, w, h, false, false, false);
   display.powerOff();
+}
+
+static void drawWifiIconBitmap(const uint8_t* bmp)
+{
+  drawIconAt(bmp, WIFI_ICON_X, WIFI_ICON_Y, WIFI_ICON_W, WIFI_ICON_H);
+}
+
+static void showTransferIcon(bool visible)
+{
+  uint8_t iconBmp[TRANSFER_ICON_BYTES];
+  buildTransferIconBitmap(iconBmp, visible);
+  drawIconAt(iconBmp, TRANSFER_ICON_X, TRANSFER_ICON_Y, TRANSFER_ICON_W, TRANSFER_ICON_H);
+  g_transferIconVisible = visible;
 }
 
 static void showWifiStatusIcon(bool connected)
@@ -553,6 +613,10 @@ static void enterLowPowerStop()
     }
     g_wifiIconVisibleOnDisplay = false;
   }
+  if (g_transferIconVisible)
+  {
+    showTransferIcon(false);
+  }
   client.stop();
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
@@ -579,63 +643,54 @@ static void serviceWiFiBoot()
 
   const uint32_t now = millis();
 
-  if (g_wifiBootState == WIFI_BOOT_RETRY_WAIT)
-  {
-    if ((now - g_wifiStateMs) < WIFI_RETRY_GAP_MS) return;
-
-    g_wifiStateMs = now;
-    g_wifiBlinkMs = now;
-    g_wifiBlinkVisible = true;
-    g_wifiBootState = WIFI_BOOT_TRYING;
-
-    Serial.printf("[NET] WiFi connecting to %s (attempt %u/%u)\n",
-                  WIFI_SSID, g_wifiAttempts + 1, WIFI_MAX_ATTEMPTS);
-    startWiFiAttempt();
-    showWifiBlinkFrame(true);
-    return;
-  }
-
   if (WiFi.status() == WL_CONNECTED)
   {
-    g_wifiAttempts++;
     g_wifiBootState = WIFI_BOOT_DONE;
     g_wifiEverConnected = true;
     g_wifiReadyMs = now;
     g_lastWiFiConnected = true;
+    g_wifiBlinkDone = true;
 
     showWifiStatusIcon(true);
-    Serial.printf("[NET] WiFi connected (attempt %u/%u), IP=",
-                  g_wifiAttempts, WIFI_MAX_ATTEMPTS);
+    Serial.print("[NET] WiFi connected, IP=");
     Serial.println(WiFi.localIP());
     return;
   }
 
-  if ((now - g_wifiStateMs) >= WIFI_ATTEMPT_MS)
+  // Auto-reconnect keeps scanning in the background; only a wall-clock
+  // deadline can stop it, so give the AP a fixed window to come up.
+  if ((now - g_wifiBootStartMs) >= WIFI_BOOT_DEADLINE_MS)
   {
-    g_wifiAttempts++;
-    Serial.printf("[NET] WiFi attempt %u/%u failed\n",
-                  g_wifiAttempts, WIFI_MAX_ATTEMPTS);
-    showWifiStatusIcon(false);
-
-    if (g_wifiAttempts >= WIFI_MAX_ATTEMPTS)
-    {
-      g_wifiBootGaveUp = true;
-      g_wifiBootState = WIFI_BOOT_DONE;
-      Serial.println("[POWER] WiFi unavailable after max attempts, sleeping");
-      enterLowPowerStop();
-      return;
-    }
-
-    g_wifiBootState = WIFI_BOOT_RETRY_WAIT;
-    g_wifiStateMs = now;
+    g_wifiBootGaveUp = true;
+    g_wifiBootState = WIFI_BOOT_DONE;
+    Serial.println("[POWER] WiFi unavailable after 90s, sleeping");
+    enterLowPowerStop();
     return;
   }
 
-  if ((now - g_wifiBlinkMs) >= WIFI_BLINK_MS)
+  // Blink a few times, then settle on the static "no network" icon.
+  if (!g_wifiBlinkDone && (now - g_wifiBlinkMs) >= WIFI_BLINK_MS)
   {
     g_wifiBlinkMs = now;
-    g_wifiBlinkVisible = !g_wifiBlinkVisible;
-    showWifiBlinkFrame(g_wifiBlinkVisible);
+    if (g_wifiBlinkVisible)
+    {
+      g_wifiBlinkVisible = false;
+      g_wifiBlinkCount++;
+      if (g_wifiBlinkCount >= WIFI_BLINK_COUNT)
+      {
+        g_wifiBlinkDone = true;
+        showWifiStatusIcon(false);
+      }
+      else
+      {
+        showWifiBlinkFrame(false);
+      }
+    }
+    else
+    {
+      g_wifiBlinkVisible = true;
+      showWifiBlinkFrame(true);
+    }
   }
 }
 
@@ -660,17 +715,20 @@ void setup()
   loadFbFromFlash();
   Serial.println("[EPD] previous screen kept, full init deferred until refresh");
 
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setAutoReconnect(true);
   configureWiFi();
 
   g_wifiBootState = WIFI_BOOT_TRYING;
-  g_wifiStateMs = millis();
-  g_wifiBlinkMs = g_wifiStateMs;
+  g_wifiBootStartMs = millis();
+  g_wifiBlinkMs = g_wifiBootStartMs;
   g_wifiBlinkVisible = true;
-  Serial.printf("[NET] WiFi connecting to %s (attempt 1/%u)\n",
-                WIFI_SSID, WIFI_MAX_ATTEMPTS);
+  g_wifiBlinkCount = 0;
+  g_wifiBlinkDone = false;
+  Serial.printf("[NET] WiFi connecting to %s (auto-retry, 90s deadline)\n", WIFI_SSID);
   startWiFiAttempt();
   showWifiBlinkFrame(true);
 }
@@ -778,6 +836,7 @@ void loop()
     {
       Serial.println("[EPD] refresh");
       refreshDisplay();
+      g_transferIconVisible = false;
       Serial.println("[EPD] refresh done");
     }
     else if (cmd == "S")
@@ -796,6 +855,7 @@ void loop()
   else if ((uint8_t)first == 0x57)
   {
     markTransferStarted();
+    if (!g_transferIconVisible) showTransferIcon(true);
     if (!readDataFrame(5000))
     {
       Serial.println("[PROTO] data frame read timeout");
